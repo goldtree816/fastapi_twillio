@@ -1,17 +1,19 @@
-from fastapi import FastAPI, Request, Response, Form, HTTPException
+from fastapi import FastAPI, Request, Response, Form, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from typing import Optional
 import logging
 import httpx
-from typing import Optional
-from datetime import datetime
 
 from config import (
     ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD,
     TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
-    WEBHOOK_BASE_URL
+    WEBHOOK_BASE_URL,
+    JWT_SECRET_KEY, JWT_ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from odoo_client import OdooClient
 from twilio_client import send_whatsapp_message, set_webhook, buy_number, TwilioError
-
 from models import SendMessageRequest, BuyNumberRequest
 
 logging.basicConfig(level=logging.INFO)
@@ -19,8 +21,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="WhatsApp FastAPI Service", version="1.0")
 
+# System Odoo client (used for business operations)
 odoo = OdooClient(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PASSWORD)
 
+# OAuth2 scheme for token extraction
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# ---------- Helper functions ----------
 def ensure_odoo():
     if not odoo.uid:
         if not odoo.login():
@@ -31,7 +38,72 @@ def ensure_odoo():
 def now_iso():
     return datetime.now().isoformat()
 
-# ---------- Incoming webhook ----------
+def authenticate_user(username: str, password: str):
+    """Authenticate against Odoo using provided credentials."""
+    # Create a temporary client with user credentials
+    user_client = OdooClient(ODOO_URL, ODOO_DB, username, password)
+    if not user_client.login():
+        return None
+    # Return user info (uid, name, etc.)
+    # We can read user data via the user_client
+    try:
+        user_data = user_client.call("res.users", "read", [[user_client.uid], ["name", "login", "email"]])
+        if user_data and len(user_data) > 0:
+            return {
+                "uid": user_client.uid,
+                "login": username,
+                "name": user_data[0].get("name", username),
+                "email": user_data[0].get("email", "")
+            }
+    except Exception as e:
+        logger.error("Failed to fetch user data: %s", e)
+    return {"uid": user_client.uid, "login": username, "name": username, "email": ""}
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        # Optional: validate against Odoo that user still exists
+        # For simplicity, return the payload
+        return {"username": username, "uid": payload.get("uid"), "name": payload.get("name")}
+    except JWTError:
+        raise credentials_exception
+
+# ---------- Login endpoint ----------
+@app.post("/login", response_model=dict)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["login"], "uid": user["uid"], "name": user["name"]},
+        expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# ---------- Public webhook (no auth) ----------
 @app.post("/webhook/inbound")
 async def twilio_webhook(
     From: str = Form(...),
@@ -39,6 +111,7 @@ async def twilio_webhook(
     MessageSid: Optional[str] = Form(None),
     MediaUrl0: Optional[str] = Form(None),
 ):
+    # ... (unchanged, keep your existing code) ...
     phone = From.replace("whatsapp:", "").strip()
     body = Body or ""
     ensure_odoo()
@@ -82,11 +155,11 @@ async def twilio_webhook(
         media_type="text/xml"
     )
 
-# ---------- Send message ----------
+# ---------- Protected endpoints ----------
 @app.post("/send_message")
-async def send_message(req: SendMessageRequest):
+async def send_message(req: SendMessageRequest, current_user: dict = Depends(get_current_user)):
     ensure_odoo()
-
+    # ... (rest of your existing code) ...
     numbers = odoo.call("whatsapp.purchased_number", "search_read",
                         [[["is_sending_number", "=", True], ["status", "=", "active"]], ["number"]])
     if not numbers:
@@ -109,12 +182,9 @@ async def send_message(req: SendMessageRequest):
         logger.error("Twilio send error: %s", error_str)
         raise HTTPException(status_code=500, detail=f"Twilio send failed: {error_str}")
 
-
-
-# ---------- Available numbers ----------
 @app.post("/available_numbers")
-async def available_numbers(request: Request):
-    # ... (unchanged – keep as before)
+async def available_numbers(request: Request, current_user: dict = Depends(get_current_user)):
+    # ... (unchanged) ...
     try:
         body = await request.json()
         country_code = body.get("country_code", "US")
@@ -164,9 +234,8 @@ async def available_numbers(request: Request):
         logger.error("Available numbers error: %s", e)
         return {"status": "error", "message": str(e)}
 
-# ---------- Buy number ----------
 @app.post("/buy_number")
-async def purchase_number(req: BuyNumberRequest):
+async def purchase_number(req: BuyNumberRequest, current_user: dict = Depends(get_current_user)):
     ensure_odoo()
     try:
         result = buy_number(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
@@ -198,9 +267,8 @@ async def purchase_number(req: BuyNumberRequest):
         logger.error("Purchase failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- List active numbers ----------
 @app.get("/numbers")
-async def list_numbers():
+async def list_numbers(current_user: dict = Depends(get_current_user)):
     ensure_odoo()
     numbers = odoo.call("whatsapp.purchased_number", "search_read",
                         [[["status", "=", "active"]], ["number", "sid", "friendly_name", "is_sending_number"]])
