@@ -9,3 +9,8 @@ class SendMessageRequest(BaseModel):
 class BuyNumberRequest(BaseModel):
     phone_number: str
     friendly_name: Optional[str] = None
+
+class MakeCallRequest(BaseModel):
+    to_phone: str
+    message: Optional[str] = None          # ignored if custom TwiML is used
+    status_callback_url: Optional[str] = None
