@@ -14,7 +14,6 @@ class OdooClient:
         self.cookies = None
 
     def login(self) -> bool:
-        """Authenticate with Odoo and store session."""
         payload = {
             "jsonrpc": "2.0",
             "method": "call",
@@ -36,7 +35,6 @@ class OdooClient:
             return False
 
     def call(self, model: str, method: str, args: List[Any] = None, kwargs: Dict[str, Any] = None) -> Any:
-        """Generic JSON‑RPC call to Odoo."""
         if not self.uid:
             raise Exception("Not authenticated. Call login() first.")
         payload = {
